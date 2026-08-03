@@ -1307,6 +1307,7 @@ async fn optimize_scoped_include_touches_only_selected_tables() {
     let scope = OptimizeScope {
         include: vec!["node:Person".to_string()],
         exclude: vec![],
+        ..Default::default()
     };
     let stats = db.optimize_scoped(&scope).await.unwrap();
 
@@ -1342,6 +1343,7 @@ async fn optimize_scoped_exclude_skips_table_and_bare_names_resolve() {
     let scope = OptimizeScope {
         include: vec![],
         exclude: vec!["Person".to_string()],
+        ..Default::default()
     };
     let stats = db.optimize_scoped(&scope).await.unwrap();
 
@@ -1371,6 +1373,7 @@ async fn optimize_scope_fails_closed_on_unknown_or_empty_selection() {
     let unknown = OptimizeScope {
         include: vec!["Nope".to_string()],
         exclude: vec![],
+        ..Default::default()
     };
     let err = db.optimize_scoped(&unknown).await.unwrap_err().to_string();
     assert!(err.contains("unknown table 'Nope'"), "got: {err}");
@@ -1379,6 +1382,7 @@ async fn optimize_scope_fails_closed_on_unknown_or_empty_selection() {
     let unknown_exclude = OptimizeScope {
         include: vec![],
         exclude: vec!["Nope".to_string()],
+        ..Default::default()
     };
     let err = db
         .optimize_scoped(&unknown_exclude)
@@ -1391,6 +1395,7 @@ async fn optimize_scope_fails_closed_on_unknown_or_empty_selection() {
     let empty = OptimizeScope {
         include: vec!["node:Person".to_string()],
         exclude: vec!["Person".to_string()],
+        ..Default::default()
     };
     let err = db.optimize_scoped(&empty).await.unwrap_err().to_string();
     assert!(err.contains("selects no tables"), "got: {err}");
@@ -1445,6 +1450,7 @@ node Heavy {
     let scope = OptimizeScope {
         include: vec!["node:Doc".to_string()],
         exclude: vec![],
+        ..Default::default()
     };
     let stats = db.optimize_scoped(&scope).await.unwrap();
     assert!(
@@ -1464,5 +1470,85 @@ node Heavy {
             .unwrap(),
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after the scoped optimize"
+    );
+}
+
+/// Coverage-only mode: restores index coverage WITHOUT rewriting data
+/// fragments — for tables whose full rewrite cannot fit a maintenance
+/// window. The uncovered-fragment fold-in is what query plans depend on
+/// (an uncovered fragment forces a brute-force scan branch); fragment
+/// merging is deferred to a full run.
+#[tokio::test]
+async fn optimize_coverage_only_restores_coverage_without_compacting() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    rank: I32 @index
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let doc_uri = node_table_uri(uri, "Doc");
+    let frags_before = Dataset::open(&doc_uri).await.unwrap().get_fragments().len();
+    assert!(frags_before >= 2, "two loads should leave >= 2 fragments");
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            "appended fragment should be unindexed before the coverage-only run"
+        );
+    }
+
+    let scope = OptimizeScope {
+        include: vec!["node:Doc".to_string()],
+        exclude: vec![],
+        coverage_only: true,
+    };
+    let stats = db.optimize_scoped(&scope).await.unwrap();
+
+    // Strictly scoped: only the selected table, no `__manifest` entry in
+    // coverage-only mode.
+    let keys: Vec<&str> = stats.iter().map(|s| s.table_key.as_str()).collect();
+    assert_eq!(keys, vec!["node:Doc"], "coverage-only must touch nothing else");
+    let doc = &stats[0];
+    assert!(doc.committed, "coverage restoration must commit + publish");
+    assert_eq!(doc.fragments_removed, 0, "must not rewrite fragments");
+    assert_eq!(doc.fragments_added, 0, "must not rewrite fragments");
+
+    // Coverage restored, fragment layout untouched.
+    let frags_after = Dataset::open(&doc_uri).await.unwrap().get_fragments().len();
+    assert_eq!(frags_before, frags_after, "no compaction in coverage-only mode");
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert!(
+        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        "coverage-only must extend index coverage to all fragments"
+    );
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "rank BTREE must cover all fragments after the coverage-only run"
     );
 }

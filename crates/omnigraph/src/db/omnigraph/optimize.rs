@@ -198,11 +198,21 @@ pub struct OptimizeScope {
     pub include: Vec<String>,
     /// Remove these tables from the selection.
     pub exclude: Vec<String>,
+    /// Skip compaction entirely: restore index coverage (fold unindexed
+    /// fragments into existing indexes) and build declared-but-missing
+    /// indexes, but never rewrite data fragments. For tables whose full
+    /// rewrite cannot fit a maintenance window (e.g. a ~9 GB vector table
+    /// over a slow object store), coverage is the part reads depend on —
+    /// an uncovered fragment forces a brute-force scan branch into every
+    /// vector/FTS query plan, while fragment-count bloat only degrades
+    /// scan setup cost. The internal `__manifest` compaction is also
+    /// skipped in this mode ("touch nothing you weren't asked to").
+    pub coverage_only: bool,
 }
 
 impl OptimizeScope {
     pub fn is_unscoped(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
+        self.include.is_empty() && self.exclude.is_empty() && !self.coverage_only
     }
 
     /// Resolve one operator-supplied table name against the catalog's table
@@ -306,13 +316,15 @@ pub async fn optimize_tables_scoped(
     let table_tasks: Vec<(String, String)> = {
         let catalog = db.catalog();
         let all_keys = all_table_keys(&catalog);
-        // An unscoped run bypasses `select` so a schema with no node/edge
-        // types stays a valid (internal-tables-only) optimize, as before.
-        let selected: std::collections::HashSet<String> = if scope.is_unscoped() {
-            all_keys.iter().cloned().collect()
-        } else {
-            scope.select(&all_keys)?
-        };
+        // A run with no table filters bypasses `select` so a schema with no
+        // node/edge types stays a valid (internal-tables-only) optimize, as
+        // before — regardless of `coverage_only`.
+        let selected: std::collections::HashSet<String> =
+            if scope.include.is_empty() && scope.exclude.is_empty() {
+                all_keys.iter().cloned().collect()
+            } else {
+                scope.select(&all_keys)?
+            };
         let mut tasks = Vec::new();
         for table_key in all_keys {
             if !selected.contains(&table_key) {
@@ -331,9 +343,10 @@ pub async fn optimize_tables_scoped(
     // node/edge types) — the internal system tables below must still be compacted.
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
+    let coverage_only = scope.coverage_only;
     let stats: Vec<Result<TableOptimizeStats>> = futures::stream::iter(table_tasks.into_iter())
         .map(move |(table_key, full_path)| async move {
-            optimize_one_table(db, table_key, full_path).await
+            optimize_one_table(db, table_key, full_path, coverage_only).await
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -371,10 +384,12 @@ pub async fn optimize_tables_scoped(
     // `_graph_commit_actors` are retired), so there is nothing else to compact.
     // `__manifest` is always present (created at init).
     let root = db.root_uri();
-    let internal_tables: [(&str, String); 1] =
-        [("__manifest", crate::db::manifest::manifest_uri(root))];
-    for (table_key, uri) in internal_tables {
-        all.push(compact_internal_table(db, table_key, uri).await);
+    if !scope.coverage_only {
+        let internal_tables: [(&str, String); 1] =
+            [("__manifest", crate::db::manifest::manifest_uri(root))];
+        for (table_key, uri) in internal_tables {
+            all.push(compact_internal_table(db, table_key, uri).await);
+        }
     }
 
     all.into_iter().collect()
@@ -394,6 +409,7 @@ async fn optimize_one_table(
     db: &Omnigraph,
     table_key: String,
     full_path: String,
+    coverage_only: bool,
 ) -> Result<TableOptimizeStats> {
     // Serialize the whole compact→publish against concurrent mutations on this
     // (table, main): compaction is a Rewrite op that retryable-conflicts with a
@@ -491,11 +507,19 @@ async fn optimize_one_table(
 
         // Precise "will it compact?" check — `plan_compaction` also accounts for
         // deletion materialization (which can rewrite even a single fragment).
+        // In coverage-only mode compaction is skipped entirely (no plan, no
+        // rewrite): index coverage is what reads depend on; fragment merging
+        // is deferred to a full run.
         let options = CompactionOptions::default();
-        let plan = plan_compaction(&ds, &options)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let will_compact = plan.num_tasks() > 0;
+        let will_compact = if coverage_only {
+            false
+        } else {
+            plan_compaction(&ds, &options)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .num_tasks()
+                > 0
+        };
         // Even with nothing to compact, the table may still have index work
         // (needs_reindex: rows appended since the index was built; needs_index_create:
         // a declared `@index` whose physical build schema apply deferred, iss-848).

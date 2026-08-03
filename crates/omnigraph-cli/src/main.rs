@@ -821,6 +821,7 @@ async fn main() -> Result<()> {
             uri,
             tables,
             exclude_tables,
+            coverage_only,
             json,
         } => {
             let uri = resolve_maintenance_uri(
@@ -837,6 +838,7 @@ async fn main() -> Result<()> {
             let scope = OptimizeScope {
                 include: tables,
                 exclude: exclude_tables,
+                coverage_only,
             };
             let stats = if scope.is_unscoped() {
                 db.optimize().await?

@@ -266,6 +266,13 @@ pub(crate) enum Command {
         /// first, then excludes are removed.
         #[arg(long = "exclude-table", value_name = "TABLE")]
         exclude_tables: Vec<String>,
+        /// Skip compaction: only restore index coverage (fold unindexed
+        /// fragments into existing indexes) and build declared-but-missing
+        /// indexes. Never rewrites data fragments; also skips the internal
+        /// `__manifest` compaction. For tables too large to rewrite in a
+        /// maintenance window — coverage is what query plans depend on.
+        #[arg(long = "coverage-only")]
+        coverage_only: bool,
         #[arg(long)]
         json: bool,
     },
