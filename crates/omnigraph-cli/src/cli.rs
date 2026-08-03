@@ -255,6 +255,17 @@ pub(crate) enum Command {
     Optimize {
         /// Graph URI
         uri: Option<String>,
+        /// Restrict the run to these tables (repeatable). Accepts
+        /// `node:<Type>`, `edge:<Type>`, or a bare type name matching
+        /// either. An unknown name is an error. The internal `__manifest`
+        /// table is always compacted (cheap, keeps metadata scans flat).
+        #[arg(long = "table", value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Optimize every table except these (repeatable; same name forms
+        /// as --table). Composable with --table: includes are selected
+        /// first, then excludes are removed.
+        #[arg(long = "exclude-table", value_name = "TABLE")]
+        exclude_tables: Vec<String>,
         #[arg(long)]
         json: bool,
     },

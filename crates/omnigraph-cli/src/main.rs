@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
+use omnigraph::db::{Omnigraph, OptimizeScope, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
@@ -817,7 +817,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Optimize { uri, json } => {
+        Command::Optimize {
+            uri,
+            tables,
+            exclude_tables,
+            json,
+        } => {
             let uri = resolve_maintenance_uri(
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -829,7 +834,15 @@ async fn main() -> Result<()> {
             .await?;
             echo_write_target(cli.quiet, "optimize", &uri, false);
             let db = Omnigraph::open(&uri).await?;
-            let stats = db.optimize().await?;
+            let scope = OptimizeScope {
+                include: tables,
+                exclude: exclude_tables,
+            };
+            let stats = if scope.is_unscoped() {
+                db.optimize().await?
+            } else {
+                db.optimize_scoped(&scope).await?
+            };
             if json {
                 let value = serde_json::json!({
                     "uri": uri,

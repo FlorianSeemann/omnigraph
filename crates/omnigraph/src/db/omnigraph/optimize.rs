@@ -185,11 +185,102 @@ pub struct TableCleanupStats {
     pub error: Option<String>,
 }
 
+/// Which data tables `optimize` touches. Built from operator `--table` /
+/// `--exclude-table` selections; each name is resolved against the catalog
+/// as `node:<Type>`, `edge:<Type>`, or a bare type name matching either.
+/// An unknown name is an error (fail closed — a typo must not silently
+/// optimize nothing / everything). The internal `__manifest` table is always
+/// compacted regardless of scope: it accumulates one fragment per commit and
+/// its compaction is cheap, in-place, and content-preserving.
+#[derive(Debug, Clone, Default)]
+pub struct OptimizeScope {
+    /// Only these tables (all tables when empty).
+    pub include: Vec<String>,
+    /// Remove these tables from the selection.
+    pub exclude: Vec<String>,
+}
+
+impl OptimizeScope {
+    pub fn is_unscoped(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Resolve one operator-supplied table name against the catalog's table
+    /// keys. Accepts an exact `node:<Type>` / `edge:<Type>` key or a bare
+    /// type name (which may match both a node and an edge type of the same
+    /// name — all matches are selected).
+    fn resolve_name<'a>(name: &str, all_keys: &'a [String]) -> Vec<&'a String> {
+        all_keys
+            .iter()
+            .filter(|k| {
+                *k == name
+                    || k.strip_prefix("node:") == Some(name)
+                    || k.strip_prefix("edge:") == Some(name)
+            })
+            .collect()
+    }
+
+    /// The selected subset of `all_keys`, preserving their order. Errors on
+    /// any name that resolves to no table, and on a scope that selects no
+    /// tables at all (e.g. `--table X --exclude-table X`).
+    fn select(&self, all_keys: &[String]) -> Result<std::collections::HashSet<String>> {
+        let mut selected: std::collections::HashSet<String> = if self.include.is_empty() {
+            all_keys.iter().cloned().collect()
+        } else {
+            let mut set = std::collections::HashSet::new();
+            for name in &self.include {
+                let matches = Self::resolve_name(name, all_keys);
+                if matches.is_empty() {
+                    return Err(OmniError::manifest(format!(
+                        "optimize scope: unknown table '{}' (expected node:<Type>, edge:<Type>, \
+                         or a bare type name from the schema)",
+                        name
+                    )));
+                }
+                set.extend(matches.into_iter().cloned());
+            }
+            set
+        };
+        for name in &self.exclude {
+            let matches = Self::resolve_name(name, all_keys);
+            if matches.is_empty() {
+                return Err(OmniError::manifest(format!(
+                    "optimize scope: unknown table '{}' (expected node:<Type>, edge:<Type>, \
+                     or a bare type name from the schema)",
+                    name
+                )));
+            }
+            for m in matches {
+                selected.remove(m);
+            }
+        }
+        if selected.is_empty() {
+            return Err(OmniError::manifest(
+                "optimize scope selects no tables (include/exclude cancel out)".to_string(),
+            ));
+        }
+        Ok(selected)
+    }
+}
+
 /// Run Lance `compact_files` on every node + edge table on `main`, publishing
 /// each compacted table's new version to the `__manifest`. Tables run in
 /// parallel (bounded concurrency); each is fault-isolated only at the Lance
 /// level — a publish error is propagated (the recovery sidecar covers it).
 pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
+    optimize_tables_scoped(db, &OptimizeScope::default()).await
+}
+
+/// [`optimize_all_tables`] restricted to a subset of data tables. The scope
+/// exists for operational reality: one oversized table (e.g. a blob-bearing
+/// table whose full rewrite cannot fit an operator's maintenance window) must
+/// not make every other table's compaction and index-coverage maintenance
+/// unrunnable. Scoped runs keep the exact same per-table machinery — write
+/// gates, recovery sidecars, manifest publish — they just visit fewer tables.
+pub async fn optimize_tables_scoped(
+    db: &Omnigraph,
+    scope: &OptimizeScope,
+) -> Result<Vec<TableOptimizeStats>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
@@ -214,8 +305,19 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     // handle before the async stream starts.
     let table_tasks: Vec<(String, String)> = {
         let catalog = db.catalog();
+        let all_keys = all_table_keys(&catalog);
+        // An unscoped run bypasses `select` so a schema with no node/edge
+        // types stays a valid (internal-tables-only) optimize, as before.
+        let selected: std::collections::HashSet<String> = if scope.is_unscoped() {
+            all_keys.iter().cloned().collect()
+        } else {
+            scope.select(&all_keys)?
+        };
         let mut tasks = Vec::new();
-        for table_key in all_table_keys(&catalog) {
+        for table_key in all_keys {
+            if !selected.contains(&table_key) {
+                continue;
+            }
             let Some(entry) = snapshot.entry(&table_key) else {
                 continue;
             };

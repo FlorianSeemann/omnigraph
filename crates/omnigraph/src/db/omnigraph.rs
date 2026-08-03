@@ -35,7 +35,9 @@ mod repair;
 mod schema_apply;
 mod table_ops;
 
-pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
+pub use optimize::{
+    CleanupPolicyOptions, OptimizeScope, SkipReason, TableCleanupStats, TableOptimizeStats,
+};
 pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
@@ -1353,6 +1355,16 @@ impl Omnigraph {
     /// node + edge table on `main`. See [`optimize`] for details.
     pub async fn optimize(&self) -> Result<Vec<optimize::TableOptimizeStats>> {
         optimize::optimize_all_tables(self).await
+    }
+
+    /// [`Self::optimize`] restricted to a subset of data tables — for when one
+    /// oversized table would otherwise make graph-wide maintenance unrunnable.
+    /// See [`optimize::optimize_tables_scoped`].
+    pub async fn optimize_scoped(
+        &self,
+        scope: &optimize::OptimizeScope,
+    ) -> Result<Vec<optimize::TableOptimizeStats>> {
+        optimize::optimize_tables_scoped(self, scope).await
     }
 
     /// Classify and explicitly repair uncovered manifest/head drift. See

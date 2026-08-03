@@ -10,8 +10,8 @@ use std::time::Duration;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use omnigraph::db::{
-    CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
-    SkipReason,
+    CleanupPolicyOptions, Omnigraph, OptimizeScope, ReadTarget, RepairAction,
+    RepairClassification, RepairOptions, SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
@@ -1278,5 +1278,191 @@ async fn optimize_materializes_index_after_type_rename() {
             .unwrap(),
         IndexCoverage::Indexed,
         "optimize must build the renamed table's deferred rank index"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scoped optimize (`--table` / `--exclude-table`): one oversized table (e.g. a
+// blob table whose full rewrite can't fit a maintenance window) must not make
+// every OTHER table's compaction + index-coverage maintenance unrunnable.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn optimize_scoped_include_touches_only_selected_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Fragments on BOTH node tables: 4 Person mutations + 2 Company loads.
+    add_person_fragments(&mut db).await;
+    for name in ["ScopeCo1", "ScopeCo2"] {
+        load_jsonl(
+            &mut db,
+            &format!("{{\"type\":\"Company\",\"data\":{{\"name\":\"{name}\"}}}}"),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    }
+
+    let scope = OptimizeScope {
+        include: vec!["node:Person".to_string()],
+        exclude: vec![],
+    };
+    let stats = db.optimize_scoped(&scope).await.unwrap();
+
+    // Only the selected data table + the always-compacted internal table.
+    let keys: Vec<&str> = stats.iter().map(|s| s.table_key.as_str()).collect();
+    assert!(keys.contains(&"node:Person"), "selected table missing: {keys:?}");
+    assert!(keys.contains(&"__manifest"), "__manifest missing: {keys:?}");
+    assert_eq!(stats.len(), 2, "scoped run must visit only the scope: {keys:?}");
+    let person = stats.iter().find(|s| s.table_key == "node:Person").unwrap();
+    assert!(person.committed, "Person had fragments to compact");
+    assert!(person.fragments_removed > 0);
+
+    // The unselected table was genuinely untouched: a follow-up FULL optimize
+    // still finds Company fragments to compact. (No no-op assertion on Person
+    // here — Lance's compaction planning may legitimately find residual work
+    // on a second pass; the scoped-run stats above already prove Person was
+    // visited, and Company's surviving work proves it was not.)
+    let full = db.optimize().await.unwrap();
+    let company = full.iter().find(|s| s.table_key == "node:Company").unwrap();
+    assert!(
+        company.committed && company.fragments_removed > 0,
+        "Company must still have compaction work after the scoped run"
+    );
+}
+
+#[tokio::test]
+async fn optimize_scoped_exclude_skips_table_and_bare_names_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    add_person_fragments(&mut db).await;
+
+    // Bare name: "Person" resolves to node:Person.
+    let scope = OptimizeScope {
+        include: vec![],
+        exclude: vec!["Person".to_string()],
+    };
+    let stats = db.optimize_scoped(&scope).await.unwrap();
+
+    let keys: Vec<&str> = stats.iter().map(|s| s.table_key.as_str()).collect();
+    assert!(
+        !keys.contains(&"node:Person"),
+        "excluded table must not be visited: {keys:?}"
+    );
+    // 2 nodes + 2 edges - excluded Person = 3 data tables, + __manifest.
+    assert_eq!(stats.len(), 4, "unexpected scope: {keys:?}");
+
+    // Person still has its fragments: the excluded table kept its work.
+    let full = db.optimize().await.unwrap();
+    let person = full.iter().find(|s| s.table_key == "node:Person").unwrap();
+    assert!(
+        person.committed && person.fragments_removed > 0,
+        "excluded Person must still have compaction work"
+    );
+}
+
+#[tokio::test]
+async fn optimize_scope_fails_closed_on_unknown_or_empty_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // Unknown table name → declared error, nothing runs.
+    let unknown = OptimizeScope {
+        include: vec!["Nope".to_string()],
+        exclude: vec![],
+    };
+    let err = db.optimize_scoped(&unknown).await.unwrap_err().to_string();
+    assert!(err.contains("unknown table 'Nope'"), "got: {err}");
+
+    // Unknown EXCLUDE fails closed too (a typo must not silently widen the run).
+    let unknown_exclude = OptimizeScope {
+        include: vec![],
+        exclude: vec!["Nope".to_string()],
+    };
+    let err = db
+        .optimize_scoped(&unknown_exclude)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown table 'Nope'"), "got: {err}");
+
+    // Include and exclude cancelling out → declared error.
+    let empty = OptimizeScope {
+        include: vec!["node:Person".to_string()],
+        exclude: vec!["Person".to_string()],
+    };
+    let err = db.optimize_scoped(&empty).await.unwrap_err().to_string();
+    assert!(err.contains("selects no tables"), "got: {err}");
+}
+
+/// The P9-shaped scenario: an index whose recent fragments are uncovered
+/// (forcing flat-scan reads) is repaired by a run scoped to JUST that table —
+/// without visiting the sibling table standing in for the "too big to
+/// compact" one.
+#[tokio::test]
+async fn optimize_scoped_restores_index_coverage_on_selected_table_only() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    rank: I32 @index
+}
+
+node Heavy {
+    slug: String @key
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    // Appends a fragment the existing rank BTREE does not cover.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            "appended fragment should be unindexed before the scoped optimize"
+        );
+    }
+
+    let scope = OptimizeScope {
+        include: vec!["node:Doc".to_string()],
+        exclude: vec![],
+    };
+    let stats = db.optimize_scoped(&scope).await.unwrap();
+    assert!(
+        stats.iter().all(|s| s.table_key != "node:Heavy"),
+        "the out-of-scope table must not be visited"
+    );
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert!(
+        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        "scoped optimize must extend index coverage to all fragments"
+    );
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "rank BTREE must cover all fragments after the scoped optimize"
     );
 }
