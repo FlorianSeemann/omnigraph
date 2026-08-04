@@ -13,3 +13,11 @@ warning: associated function `skipped` is never used
    Compiling omnigraph-cluster v0.8.1 (/private/tmp/claude-501/-Users-floseemann-emdash-worktrees-omnigraph-emdash-repo-overview-v0onw/d783e222-3629-466b-907f-7f405d5f11c9/scratchpad/omnigraph-src/crates/omnigraph-cluster)
    Compiling omnigraph-api-types v0.8.1 (/private/tmp/claude-501/-Users-floseemann-emdash-worktrees-omnigraph-emdash-repo-overview-v0onw/d783e222-3629-466b-907f-7f405d5f11c9/scratchpad/omnigraph-src/crates/omnigraph-api-types)
    Compiling omnigraph-server v0.8.1 (/private/tmp/claude-501/-Users-floseemann-emdash-worktrees-omnigraph-emdash-repo-overview-v0onw/d783e222-3629-466b-907f-7f405d5f11c9/scratchpad/omnigraph-src/crates/omnigraph-server)
+warning: `omnigraph-engine` (lib) generated 1 warning
+   Compiling omnigraph-cli v0.8.1 (/private/tmp/claude-501/-Users-floseemann-emdash-worktrees-omnigraph-emdash-repo-overview-v0onw/d783e222-3629-466b-907f-7f405d5f11c9/scratchpad/omnigraph-src/crates/omnigraph-cli)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `omnigraph-cli` (bin "omnigraph") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 8m 06s

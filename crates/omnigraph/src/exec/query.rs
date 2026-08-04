@@ -143,6 +143,20 @@ struct RrfMode {
 }
 
 /// Extract search ordering mode from the IR.
+/// IVF probe budget for `nearest()` scans. Defaults to 20 — pylance's
+/// long-standing default — because Lance's Rust scanner default (min 1, no
+/// max) probes every partition on this rev, turning ANN into a full read of
+/// the raw-vector index payload. Recall/latency is tunable per deployment
+/// via `OMNIGRAPH_ANN_NPROBES` (values are clamped to >= 1; Lance itself
+/// caps at the partition count).
+fn ann_nprobes() -> usize {
+    std::env::var("OMNIGRAPH_ANN_NPROBES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20)
+}
+
 async fn extract_search_mode(
     ir: &QueryIR,
     params: &ParamMap,
@@ -2029,6 +2043,16 @@ async fn execute_node_scan(
                     scanner
                         .nearest(prop, &query_arr, k)
                         .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+                    // Lance's Rust scanner defaults to minimum_nprobes=1 with
+                    // NO maximum — on this Lance rev that degenerates into
+                    // probing EVERY IVF partition, i.e. a full read of the
+                    // raw-vector index payload per query (measured 289s vs
+                    // 7.5s at 852k × 3072-dim over object storage). Pin the
+                    // probe budget to the same default pylance has shipped
+                    // for years; operators tune recall/latency via
+                    // OMNIGRAPH_ANN_NPROBES without a rebuild. Must be set
+                    // AFTER `nearest` (it no-ops with a warning before).
+                    scanner.nprobes(ann_nprobes());
                 }
             }
 
