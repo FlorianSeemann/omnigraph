@@ -1523,6 +1523,7 @@ node Doc {
         include: vec!["node:Doc".to_string()],
         exclude: vec![],
         coverage_only: true,
+        ..Default::default()
     };
     let stats = db.optimize_scoped(&scope).await.unwrap();
 

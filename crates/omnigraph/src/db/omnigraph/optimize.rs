@@ -208,11 +208,22 @@ pub struct OptimizeScope {
     /// scan setup cost. The internal `__manifest` compaction is also
     /// skipped in this mode ("touch nothing you weren't asked to").
     pub coverage_only: bool,
+    /// Rebuild every EXISTING vector index on the selected tables through
+    /// the current partition sizing (`ivf_partition_count`), replacing the
+    /// old index. Delta folds extend coverage but never re-partition, so an
+    /// index built when its table was small stops pruning as the table
+    /// grows — every ANN probe then reads the whole column. A retrain is a
+    /// full rebuild (reads the column, retrains centroids, rewrites the
+    /// index) — run it deliberately, scoped to the affected table.
+    pub retrain_vector: bool,
 }
 
 impl OptimizeScope {
     pub fn is_unscoped(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty() && !self.coverage_only
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && !self.coverage_only
+            && !self.retrain_vector
     }
 
     /// Resolve one operator-supplied table name against the catalog's table
@@ -344,9 +355,10 @@ pub async fn optimize_tables_scoped(
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
     let coverage_only = scope.coverage_only;
+    let retrain_vector = scope.retrain_vector;
     let stats: Vec<Result<TableOptimizeStats>> = futures::stream::iter(table_tasks.into_iter())
         .map(move |(table_key, full_path)| async move {
-            optimize_one_table(db, table_key, full_path, coverage_only).await
+            optimize_one_table(db, table_key, full_path, coverage_only, retrain_vector).await
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -410,6 +422,7 @@ async fn optimize_one_table(
     table_key: String,
     full_path: String,
     coverage_only: bool,
+    retrain_vector: bool,
 ) -> Result<TableOptimizeStats> {
     // Serialize the whole compact→publish against concurrent mutations on this
     // (table, main): compaction is a Rewrite op that retryable-conflicts with a
@@ -533,7 +546,13 @@ async fn optimize_one_table(
         } else {
             super::table_ops::needs_index_work_edge(db, &full_path, None).await?
         };
-        if !will_compact && !needs_reindex && !needs_index_create {
+        // Retrain counts as work ONLY when this table actually has an
+        // existing, trainable vector index — a table with nothing to retrain
+        // must still be able to no-op-return (pinning it would produce a
+        // zero-commit pin that recovery classifies as NoMovement).
+        let will_retrain = retrain_vector
+            && super::table_ops::has_retrainable_vector_index(db, &table_key, &full_path).await?;
+        if !will_compact && !needs_reindex && !needs_index_create && !will_retrain {
             if head_advanced {
                 // Nothing left to compact, but a prior attempt already advanced HEAD
                 // (e.g. the strip committed, then compaction conflicted, and the reopen
@@ -636,6 +655,16 @@ async fn optimize_one_table(
 
         let catalog = db.catalog();
         let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
+        if will_retrain {
+            // Full rebuild through the current partition sizing (replaces the
+            // existing index). An inline commit — the version diff below folds
+            // it into `head_advanced` for the Phase C publish. Runs before the
+            // missing-index build (the two touch disjoint indexes). Errors are
+            // fatal, not retried: a retrain is a deliberate, scoped operator
+            // action and its failure must surface loudly.
+            super::table_ops::retrain_vector_indices_on_dataset(db, &table_key, &mut snapshot)
+                .await?;
+        }
         let pending_indexes: Vec<super::PendingIndex> =
             super::table_ops::build_indices_on_dataset_for_catalog(
                 db,

@@ -1697,8 +1697,24 @@ impl TableStore {
         }))
     }
 
+    /// See [`ivf_partition_count`] for how the IVF partition count is sized.
     pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
-        let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+        // IVF partition count must scale with the table (~sqrt(N)): an IVF
+        // index prunes I/O only across partitions, so a small hardcoded count
+        // degenerates every ANN probe into a full-column read. (The 2026-08
+        // p9 incident: 852k × 3072-dim vectors behind 8 partitions meant
+        // every semantic query pulled the entire ~10.5 GB index from object
+        // storage.) Sized from the NON-NULL vector count — k-means cannot
+        // train more centroids than it has vectors — and floored at the old
+        // behavior for tiny tables.
+        let non_null = ds
+            .count_rows(Some(format!("{} IS NOT NULL", column)))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let params = lance::index::vector::VectorIndexParams::ivf_flat(
+            ivf_partition_count(non_null),
+            MetricType::L2,
+        );
         ds.create_index_builder(&[column], IndexType::Vector, &params)
             .replace(true)
             .await
@@ -2058,6 +2074,18 @@ fn check_batch_unique_by_keys(
     Ok(())
 }
 
+/// IVF partition count for a vector index over `vectors` trainable rows:
+/// ~sqrt(N), clamped to [1, 4096] and never above the vector count (k-means
+/// cannot train more centroids than it has vectors). Query cost scales with
+/// (probed partitions / total partitions) × column size, so the count must
+/// grow with the table — an index built when the table was small and never
+/// retrained keeps its stale partition count forever (delta folds extend
+/// coverage but never re-partition); `optimize --retrain-vector-index`
+/// exists to rebuild through this sizing at the current scale.
+pub(crate) fn ivf_partition_count(vectors: usize) -> usize {
+    ((vectors as f64).sqrt().ceil() as usize).clamp(1, 4096).min(vectors.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2098,5 +2126,20 @@ mod tests {
             check_batch_unique_by_keys(&batch, &["id".to_string(), "other".to_string()], "test")
                 .unwrap_err();
         assert!(err.to_string().contains("single-column keys only"));
+    }
+}
+
+#[cfg(test)]
+mod ivf_partition_tests {
+    use super::ivf_partition_count;
+
+    #[test]
+    fn scales_with_sqrt_and_clamps() {
+        assert_eq!(ivf_partition_count(0), 1);
+        assert_eq!(ivf_partition_count(1), 1);
+        assert_eq!(ivf_partition_count(2), 2); // never above the vector count
+        assert_eq!(ivf_partition_count(100), 10);
+        assert_eq!(ivf_partition_count(852_651), 924); // the p9 incident scale
+        assert_eq!(ivf_partition_count(100_000_000), 4096); // upper clamp
     }
 }

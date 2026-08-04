@@ -273,6 +273,15 @@ pub(crate) enum Command {
         /// maintenance window — coverage is what query plans depend on.
         #[arg(long = "coverage-only")]
         coverage_only: bool,
+        /// Rebuild every EXISTING vector index on the selected tables at the
+        /// current table scale (partition count ~sqrt(rows), replacing the
+        /// old index). Delta folds never re-partition, so an index built when
+        /// its table was small stops pruning as the table grows and every
+        /// ANN probe degenerates into a full-column read. A retrain reads
+        /// the whole vector column and rewrites the index — run it
+        /// deliberately, scoped with --table.
+        #[arg(long = "retrain-vector-index")]
+        retrain_vector_index: bool,
         #[arg(long)]
         json: bool,
     },

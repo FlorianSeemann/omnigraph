@@ -1486,3 +1486,116 @@ mod classify_fork_ref_tests {
         );
     }
 }
+
+/// Does this node table have at least one EXISTING, trainable vector index
+/// that `retrain_vector_indices_on_dataset` would rebuild? Used by optimize's
+/// planning step so a retrain-mode run neither no-op-returns past a
+/// retrainable table nor pins a table that will produce zero commits (a
+/// zero-commit pin classifies NoMovement on recovery and rolls back sibling
+/// tables' legitimate work). Missing indexes are the build path's job, not
+/// the retrain's.
+pub(super) async fn has_retrainable_vector_index(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+) -> Result<bool> {
+    let Some(type_name) = table_key.strip_prefix("node:") else {
+        return Ok(false); // edges get BTree only — nothing vector to retrain
+    };
+    let catalog = db.catalog();
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return Ok(false);
+    };
+    let has_vector_prop = node_type.indices.iter().any(|cols| {
+        cols.len() == 1
+            && node_type
+                .properties
+                .get(&cols[0])
+                .map(|t| matches!(node_prop_index_kind(t), Some(NodePropIndexKind::Vector)))
+                .unwrap_or(false)
+    });
+    if !has_vector_prop {
+        return Ok(false);
+    }
+    let ds = db.storage().open_dataset_head(full_path, None).await?;
+    for index_cols in &node_type.indices {
+        if index_cols.len() != 1 {
+            continue;
+        }
+        let prop_name = &index_cols[0];
+        let Some(prop_type) = node_type.properties.get(prop_name) else {
+            continue;
+        };
+        if !matches!(node_prop_index_kind(prop_type), Some(NodePropIndexKind::Vector)) {
+            continue;
+        }
+        if db.storage().has_vector_index(&ds, prop_name).await?
+            && vector_column_trainable(db, &ds, prop_name).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuild (replace) every EXISTING, trainable vector index on this node
+/// table through the current partition sizing (`ivf_partition_count`).
+/// Exists because delta folds (`optimize_indices`) extend an index's
+/// coverage but never re-partition it: an index built when the table was
+/// small keeps its stale partition count forever, and once partitions stop
+/// pruning, every ANN probe degenerates into a full-column read (the 2026-08
+/// p9 incident: 852k × 3072-dim vectors behind 8 partitions → ~10.5 GB read
+/// per semantic query). Missing indexes stay the build path's job. Returns
+/// true when at least one index was rebuilt (an inline commit — the caller's
+/// version diff picks it up for the publish).
+pub(super) async fn retrain_vector_indices_on_dataset(
+    db: &Omnigraph,
+    table_key: &str,
+    ds: &mut SnapshotHandle,
+) -> Result<bool> {
+    let Some(type_name) = table_key.strip_prefix("node:") else {
+        return Ok(false);
+    };
+    let catalog = db.catalog();
+    let Some(node_type) = catalog.node_types.get(type_name) else {
+        return Ok(false);
+    };
+    let mut rebuilt = false;
+    for index_cols in &node_type.indices {
+        if index_cols.len() != 1 {
+            continue;
+        }
+        let prop_name = &index_cols[0];
+        let Some(prop_type) = node_type.properties.get(prop_name) else {
+            continue;
+        };
+        if !matches!(node_prop_index_kind(prop_type), Some(NodePropIndexKind::Vector)) {
+            continue;
+        }
+        if !db.storage().has_vector_index(ds, prop_name).await? {
+            continue;
+        }
+        if !vector_column_trainable(db, ds, prop_name).await? {
+            continue;
+        }
+        let new_snap = db
+            .storage_inline_residual()
+            .create_vector_index(ds.clone(), prop_name.as_str())
+            .await
+            .map_err(|e| {
+                OmniError::Lance(format!(
+                    "retrain Vector index on {}({}): {}",
+                    table_key, prop_name, e
+                ))
+            })?;
+        *ds = new_snap;
+        rebuilt = true;
+        tracing::info!(
+            target: "omnigraph::index",
+            table = %table_key,
+            column = %prop_name,
+            "retrained vector index at current table scale",
+        );
+    }
+    Ok(rebuilt)
+}

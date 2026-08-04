@@ -822,6 +822,7 @@ async fn main() -> Result<()> {
             tables,
             exclude_tables,
             coverage_only,
+            retrain_vector_index,
             json,
         } => {
             let uri = resolve_maintenance_uri(
@@ -839,6 +840,7 @@ async fn main() -> Result<()> {
                 include: tables,
                 exclude: exclude_tables,
                 coverage_only,
+                retrain_vector: retrain_vector_index,
             };
             let stats = if scope.is_unscoped() {
                 db.optimize().await?
