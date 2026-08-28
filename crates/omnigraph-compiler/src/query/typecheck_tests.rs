@@ -373,6 +373,23 @@ order { nearest($d.embedding, $q) }
 }
 
 #[test]
+fn test_bm25_requires_limit() {
+    let catalog = setup_vector();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match { $d: Doc }
+return { $d.id_str }
+order { bm25($d.id_str, $q) }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains("T23"));
+}
+
+#[test]
 fn test_nearest_vector_dim_mismatch() {
     let catalog = setup_vector();
     let qf = parse_query(
@@ -511,6 +528,7 @@ query q($q: String) {
 match { $p: Person }
 return { $p.name, bm25($p.name, $q) as score }
 order { bm25($p.name, $q) desc }
+limit 3
 }
 "#,
     )

@@ -177,6 +177,19 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
             "T17: nearest ordering requires a limit clause".to_string(),
         ));
     }
+    // A standalone bm25 ordering is a top-k search exactly like nearest: the
+    // limit is pushed into the FTS source as k. Without one, Lance would
+    // return every matching row BM25-ranked and the engine would materialize
+    // the full matching set before trimming — reject it like T17/T21.
+    let has_standalone_bm25 = query
+        .order_clause
+        .iter()
+        .any(|ord| matches!(ord.expr, Expr::Bm25 { .. }));
+    if has_standalone_bm25 && query.limit.is_none() {
+        return Err(CompilerError::Type(
+            "T23: bm25 ordering requires a limit clause".to_string(),
+        ));
+    }
     if has_standalone_nearest
         && query
             .order_clause

@@ -128,8 +128,8 @@ impl Omnigraph {
 struct SearchMode {
     /// Vector ANN search: (variable, property, query_vector, k).
     nearest: Option<(String, String, Vec<f32>, usize)>,
-    /// BM25 full-text search: (variable, property, query_text).
-    bm25: Option<(String, String, String)>,
+    /// BM25 full-text search: (variable, property, query_text, k).
+    bm25: Option<(String, String, String, usize)>,
     /// RRF fusion: (primary, secondary, k_constant, limit).
     rrf: Option<RrfMode>,
 }
@@ -199,8 +199,16 @@ async fn extract_search_mode(
             let text = resolve_to_string(query, params).ok_or_else(|| {
                 OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
+            // Same contract as nearest(): without a k pushed into the FTS
+            // search, Lance returns EVERY matching row BM25-ranked and the
+            // query's `limit` only trims after full materialization — at
+            // corpus scale that is a multi-GB intermediate (and with a join,
+            // an Arrow 2 GB offset overflow).
+            let k = ir.limit.ok_or_else(|| {
+                OmniError::manifest("bm25() ordering requires a limit clause".to_string())
+            })? as usize;
             Ok(SearchMode {
-                bm25: Some((var, prop, text)),
+                bm25: Some((var, prop, text, k)),
                 ..Default::default()
             })
         }
@@ -276,8 +284,11 @@ async fn extract_sub_search_mode(
             let text = resolve_to_string(query, params).ok_or_else(|| {
                 OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
+            // rrf() already requires a limit; bound this leg by it like the
+            // nearest leg above so neither source materializes the corpus.
+            let k = limit.unwrap_or(100) as usize;
             Ok(SearchMode {
-                bm25: Some((var, prop, text)),
+                bm25: Some((var, prop, text, k)),
                 ..Default::default()
             })
         }
@@ -2057,11 +2068,17 @@ async fn execute_node_scan(
             }
 
             // Apply BM25 full-text search if this variable is the target
-            if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
+            if let Some((ref var, ref prop, ref text, k)) = search_mode.bm25 {
                 if var == variable {
+                    // `limit` bounds the FTS source to the top-k BM25 hits.
+                    // Without it Lance's default (`limit: None`) returns every
+                    // matching row — the scan then materializes the full
+                    // matching set across all projected columns before the
+                    // pipeline-end limit trims it.
                     let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
                         .with_column(prop.clone())
-                        .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?;
+                        .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?
+                        .limit(Some(k as i64));
                     scanner
                         .full_text_search(fts_query)
                         .map_err(|e| OmniError::Lance(format!("full_text_search: {}", e)))?;
