@@ -993,6 +993,10 @@ pub async fn cleanup_all_tables(
     let before_timestamp = options.older_than.map(|d| Utc::now() - d);
     let keep_versions = options.keep_versions;
 
+    // Versions of main's tables that a live branch still reads. Resolved up front: if any branch's
+    // snapshot can't be resolved we don't know what it pins, so the whole GC is refused.
+    let branch_pins = branch_pinned_main_versions(db).await?;
+
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
@@ -1001,7 +1005,8 @@ pub async fn cleanup_all_tables(
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            Some((table_key, full_path))
+            let pin = branch_pins.get(&table_key).copied();
+            Some((table_key, full_path, pin))
         })
         .collect();
 
@@ -1017,7 +1022,7 @@ pub async fn cleanup_all_tables(
     // cleanup is the convergence backstop, so it must do as much as it can and
     // converge on re-run rather than fail wholesale (invariant 13).
     let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
-        .map(|(table_key, full_path)| async move {
+        .map(|(table_key, full_path, pin)| async move {
             let outcome: Result<RemovalStats> = async {
                 crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
@@ -1027,9 +1032,11 @@ pub async fn cleanup_all_tables(
                     .open_dataset_head(&full_path, None)
                     .await?;
                 let ds = handle.into_dataset();
-                let before_version = keep_versions
-                    .map(|n| ds.version().version.saturating_sub(n as u64))
-                    .filter(|v| *v > 0);
+                let before_version = protect_branch_pin(
+                    keep_versions.map(|n| ds.version().version.saturating_sub(n as u64)),
+                    pin,
+                )
+                .filter(|v| *v > 0);
                 let policy = CleanupPolicy {
                     before_timestamp,
                     before_version,
@@ -1071,6 +1078,46 @@ pub async fn cleanup_all_tables(
         .await;
 
     Ok(results)
+}
+
+/// Per table, the OLDEST version of main's dataset that any live branch still reads.
+///
+/// A branch that hasn't written a table does not fork it: its manifest snapshot points at main's
+/// dataset at the version current when the branch was created (`table_branch == None`). Lance's
+/// `cleanup_old_versions` knows nothing about Omnigraph branches, so a `--keep N` sweep after N+ main
+/// writes deleted that version and the branch failed every read of the table with
+/// `_versions/<n>.manifest was not found` (P9, 2026-09-29: 10 of 16 open branches). Forked tables
+/// (`table_branch == Some(_)`) live under their own Lance branch and are not in this map.
+pub(crate) async fn branch_pinned_main_versions(
+    db: &Omnigraph,
+) -> Result<std::collections::HashMap<String, u64>> {
+    let branches = db.coordinator.read().await.all_branches().await?;
+    let mut pins: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for branch in branches.iter().filter(|b| b.as_str() != "main") {
+        let snapshot = db.snapshot_for_branch(Some(branch)).await.map_err(|err| {
+            OmniError::manifest(format!(
+                "cleanup refused: cannot resolve branch '{branch}' to see which versions it \
+                 still reads ({err}); delete or repair the branch, then rerun cleanup"
+            ))
+        })?;
+        for entry in snapshot.entries().filter(|e| e.table_branch.is_none()) {
+            pins.entry(entry.table_key.clone())
+                .and_modify(|v| *v = (*v).min(entry.table_version))
+                .or_insert(entry.table_version);
+        }
+    }
+    Ok(pins)
+}
+
+/// Lance removes versions strictly below `before_version`. Clamp it so the version a branch pins
+/// survives; with no retention-derived bound (`--older-than` only) the pin becomes the bound, which
+/// Lance ANDs with the time cutoff.
+pub(crate) fn protect_branch_pin(before_version: Option<u64>, pin: Option<u64>) -> Option<u64> {
+    match (before_version, pin) {
+        (Some(v), Some(p)) => Some(v.min(p)),
+        (None, Some(p)) => Some(p),
+        (v, None) => v,
+    }
 }
 
 /// Outcome of [`reconcile_orphaned_branches`]: the `(owner, branch)` pairs

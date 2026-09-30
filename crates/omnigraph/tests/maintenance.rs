@@ -17,8 +17,8 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
-    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
-    snapshot_main,
+    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
+    mixed_params, mutate_main, snapshot_branch, snapshot_main,
 };
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
@@ -1130,6 +1130,92 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     // main is untouched.
     assert_eq!(count_rows(&db, "node:Person").await, main_people);
     assert_eq!(count_rows(&db, "node:Company").await, main_companies);
+}
+
+// A branch that never wrote a table reads main's dataset at the version current when the branch
+// was created. `cleanup --keep N` after N+ main writes used to delete that version, and every read
+// of the table on the branch failed with `_versions/<n>.manifest was not found` — P9 lost 10 of 16
+// open review branches this way (2026-09-29). cleanup must keep every version a live branch pins,
+// and reclaim it once the branch is gone.
+#[tokio::test]
+async fn cleanup_keeps_main_versions_a_live_branch_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("review").await.unwrap();
+    // The branch writes one table (Company is forked) and only READS Person from main.
+    db.load_as(
+        "review",
+        None,
+        r#"{"type":"Company","data":{"name":"Acme"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    let branch_people = count_rows_branch(&db, "review", "node:Person").await;
+    let branch_companies = count_rows_branch(&db, "review", "node:Company").await;
+    let pinned = snapshot_branch(&db, "review")
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .map(|e| (e.table_version, e.table_branch.clone()))
+        .unwrap();
+    assert_eq!(pinned.1, None, "precondition: Person is not forked on the branch");
+
+    // main moves Person well past the branch's version.
+    for i in 0..4 {
+        db.load_as(
+            "main",
+            None,
+            &format!(r#"{{"type":"Person","data":{{"name":"Main{i}","age":{i}}}}}"#),
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let person_uri = node_table_uri(&uri, "Person");
+    let head = Dataset::open(&person_uri).await.unwrap().version().version;
+    assert!(head >= pinned.0 + 4, "precondition: main advanced Person past the branch pin");
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    // The branch still reads both tables, unchanged.
+    assert_eq!(count_rows_branch(&db, "review", "node:Person").await, branch_people);
+    assert_eq!(count_rows_branch(&db, "review", "node:Company").await, branch_companies);
+    // …and the pinned version itself survived.
+    Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_version(pinned.0)
+        .await
+        .expect("cleanup must keep the Person version the branch reads");
+
+    // Once the branch is gone the pin is released and the next cleanup reclaims the version.
+    db.branch_delete("review").await.unwrap();
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .checkout_version(pinned.0)
+            .await
+            .is_err(),
+        "with no branch pinning it, the old version is reclaimed"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, branch_people + 4);
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
