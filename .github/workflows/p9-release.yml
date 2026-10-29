@@ -1,0 +1,51 @@
+# P9 fork release: build the Linux x86_64 archive for a p9 patch tag (vX.Y.Z-p9.N) and attach it to a GitHub
+# release on this fork. Upstream's release.yml accepts only vMAJOR.MINOR.PATCH, so p9 tags take this path.
+# Same build command and packaging as build-release-archives.yml (Ubuntu 24.04 → glibc 2.39).
+name: P9 release
+
+on:
+  push:
+    tags: ["v*-p9.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: ""
+      OMNIGRAPH_SOURCE_VERSION: ${{ github.sha }}
+      OMNIGRAPH_RELEASE_CHANNEL: edge
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build release binaries
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission --features omnigraph-server/aws
+      - name: Package
+        run: |
+          mkdir -p release
+          for b in omnigraph omnigraph-server omnigraph-azure-admission; do install -m 0755 "target/release/$b" "release/$b"; done
+          release/omnigraph version
+          tar -C release -czf omnigraph-linux-x86_64.tar.gz omnigraph omnigraph-server omnigraph-azure-admission
+          sha256sum omnigraph-linux-x86_64.tar.gz > omnigraph-linux-x86_64.sha256
+          cat omnigraph-linux-x86_64.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" omnigraph-linux-x86_64.tar.gz omnigraph-linux-x86_64.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag \
+            --notes "P9 patch build: upstream v0.14.0 + ModernRelay/omnigraph#1189 (inline s3:// cluster root for optimize, cleanup, force-unlock). Linux x86_64 only." \
+          || gh release upload "$TAG" omnigraph-linux-x86_64.tar.gz omnigraph-linux-x86_64.sha256 --repo "$GITHUB_REPOSITORY" --clobber
