@@ -717,6 +717,18 @@ pub struct TableState {
 // read-your-writes fragment delta of a staged effect.
 #[allow(dead_code)]
 /// One foldable index whose segments leave fragments uncovered.
+/// P9 fork: the IVF partition count for a vector column holding `rows` vectors — about √rows, so a
+/// `nearest` under the default `ann_nprobes` reads a few percent of the vectors instead of all of them
+/// (the engine's one-partition index is a flat scan: ~60 s per query at 1M × 3072 floats). Columns under
+/// 65,536 vectors keep the single partition, where a flat scan is cheap. Upstream: dev-graph iss-687.
+pub(crate) fn target_vector_partitions(rows: usize) -> usize {
+    if rows < 65_536 {
+        1
+    } else {
+        ((rows as f64).sqrt() as usize).clamp(1, 4096)
+    }
+}
+
 struct IndexLag {
     name: String,
     fields: Vec<i32>,
@@ -2780,7 +2792,14 @@ impl TableStore {
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
-            if complete && !(vector && segments.len() > 1) {
+            // P9 fork: a vector index with under half its size-aware partition count is rebuilt to it
+            // (the half keeps a growing table from rebuilding on every small change in √rows).
+            let undersized = vector && {
+                let have = Self::vector_partition_count(ds, &name).await;
+                let rows = ds.count_rows(None).await.unwrap_or(0);
+                have * 2 < target_vector_partitions(rows)
+            };
+            if complete && !(vector && segments.len() > 1) && !undersized {
                 continue;
             }
             lag.push(IndexLag {
@@ -2824,7 +2843,11 @@ impl TableStore {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let mut partitions = Self::vector_partition_count(ds, &item.name).await;
+                let target = target_vector_partitions(ds.count_rows(None).await.unwrap_or(0));
+                if partitions * 2 < target {
+                    partitions = target;
+                }
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
@@ -4889,8 +4912,14 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
-                    let params =
-                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+                    let rows = ds
+                        .count_rows(Some(format!("`{column}` IS NOT NULL")))
+                        .await
+                        .unwrap_or(0);
+                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                        target_vector_partitions(rows),
+                        MetricType::L2,
+                    );
                     let new_idx = ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
