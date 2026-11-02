@@ -6,6 +6,8 @@ name: P9 release
 on:
   push:
     tags: ["v*-p9.*"]
+  # Manual start for a p9 tag (gh workflow run p9-release.yml --ref <tag>) when a tag push didn't trigger a run.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
